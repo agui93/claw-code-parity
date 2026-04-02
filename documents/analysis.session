@@ -1,0 +1,238 @@
+已读完 rust/crates/runtime/src/session.rs (1239 行)。这是会话管理和持久化的核心模块。
+                                         
+  核心结构总结
+                                                                                                                                  
+  1. 数据结构 (lines 1-77)
+                                                                                                                                  
+  // 常量                                                                                                                       
+  SESSION_VERSION: u32 = 1
+  ROTATE_AFTER_BYTES: u64 = 256 * 1024  // 256KB 后轮转
+  MAX_ROTATED_FILES: usize = 3          // 最多保留 3 个轮转文件
+  SESSION_ID_COUNTER: AtomicU64        // 全局会话 ID 计数器
+
+  // 核心枚举
+  MessageRole: System | User | Assistant | Tool
+
+  ContentBlock:
+    - Text { text: String }
+    - ToolUse { id, name, input }
+    - ToolResult { tool_use_id, tool_name, output, is_error }
+
+  // 核心结构
+  ConversationMessage {
+    role: MessageRole,
+    blocks: Vec<ContentBlock>,
+    usage: Option<TokenUsage>
+  }
+
+  SessionCompaction {
+    count: u32,                    // 压缩次数
+    removed_message_count: usize,  // 删除的消息数
+    summary: String                // 压缩摘要
+  }
+
+  SessionFork {
+    parent_session_id: String,
+    branch_name: Option<String>
+  }
+
+  Session {
+    version: u32,
+    session_id: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    messages: Vec<ConversationMessage>,
+    compaction: Option<SessionCompaction>,
+    fork: Option<SessionFork>,
+    persistence: Option<SessionPersistence>  // 私有字段
+  }
+
+  2. 会话 ID 生成 (lines 839-843)
+
+  fn generate_session_id() -> String {
+      let millis = current_time_millis();
+      let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+      format!("session-{millis}-{counter}")
+  }
+  - 格式：session-{timestamp_ms}-{counter}
+  - 使用原子计数器保证唯一性
+
+  3. 持久化格式 (lines 151-174, 310-387)
+
+  两种格式支持：
+
+  1. JSONL 格式（推荐）：
+    - 每行一个 JSON 对象
+    - 记录类型：session_meta, message, compaction
+    - 支持增量追加（append-only）
+    - 示例：
+    {"type":"session_meta","version":1,"session_id":"session-123-0",...}
+  {"type":"message","message":{"role":"user","blocks":[...]}}
+  {"type":"compaction","count":1,"removed_message_count":4,...}
+  2. JSON 格式（遗留）：
+    - 单个 JSON 对象
+    - 包含完整的 messages 数组
+    - 向后兼容旧版本
+
+  加载逻辑 (lines 160-174)：
+  pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
+      let contents = fs::read_to_string(path)?;
+      let session = match JsonValue::parse(&contents) {
+          Ok(value) if value.as_object().is_some_and(|obj| obj.contains_key("messages")) => {
+              Self::from_json(&value)?  // 遗留 JSON 格式
+          }
+          _ => Self::from_jsonl(&contents)?  // JSONL 格式
+      };
+      Ok(session.with_persistence_path(path.to_path_buf()))
+  }
+
+  4. 增量追加机制 (lines 176-190, 404-418)
+
+  pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
+      self.touch();  // 更新 updated_at_ms
+      self.messages.push(message);
+      let persist_result = {
+          let message_ref = self.messages.last().ok_or(...)?;
+          self.append_persisted_message(message_ref)
+      };
+      if let Err(error) = persist_result {
+          self.messages.pop();  // 回滚
+          return Err(error);
+      }
+      Ok(())
+  }
+
+  fn append_persisted_message(&self, message: &ConversationMessage) -> Result<(), SessionError> {
+      let Some(path) = self.persistence_path() else {
+          return Ok(());  // 无持久化路径，跳过
+      };
+
+      let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+      if needs_bootstrap {
+          self.save_to_path(path)?;  // 首次保存完整快照
+          return Ok(());
+      }
+
+      let mut file = OpenOptions::new().append(true).open(path)?;
+      writeln!(file, "{}", message_record(message).render())?;  // 追加单行
+      Ok(())
+  }
+
+  关键特性：
+  - 首次保存：写入完整快照（meta + 所有消息）
+  - 后续追加：仅追加新消息（单行 JSONL）
+  - 失败回滚：追加失败时从内存中移除消息
+
+  5. 原子写入 (lines 845-853)
+
+  fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
+      if let Some(parent) = path.parent() {
+          fs::create_dir_all(parent)?;
+      }
+      let temp_path = temporary_path_for(path);  // session.jsonl.tmp-{timestamp}-{counter}
+      fs::write(&temp_path, contents)?;
+      fs::rename(temp_path, path)?;  // 原子重命名
+      Ok(())
+  }
+
+  6. 文件轮转机制 (lines 867-923)
+
+  fn rotate_session_file_if_needed(path: &Path) -> Result<(), SessionError> {
+      let Ok(metadata) = fs::metadata(path) else {
+          return Ok(());
+      };
+      if metadata.len() < ROTATE_AFTER_BYTES {  // 256KB
+          return Ok(());
+      }
+      let rotated_path = rotated_log_path(path);  // session.rot-{timestamp}.jsonl
+      fs::rename(path, rotated_path)?;
+      Ok(())
+  }
+
+  fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
+      // 查找所有 {stem}.rot-*.jsonl 文件
+      // 按修改时间排序
+      // 删除超过 MAX_ROTATED_FILES (3) 的旧文件
+  }
+
+  轮转流程：
+  1. 保存前检查文件大小
+  2. 超过 256KB → 重命名为 .rot-{timestamp}.jsonl
+  3. 写入新快照
+  4. 清理旧轮转文件（保留最新 3 个）
+
+  7. 会话分叉 (lines 207-223)
+
+  pub fn fork(&self, branch_name: Option<String>) -> Self {
+      let now = current_time_millis();
+      Self {
+          version: self.version,
+          session_id: generate_session_id(),  // 新 ID
+          created_at_ms: now,
+          updated_at_ms: now,
+          messages: self.messages.clone(),    // 克隆消息
+          compaction: self.compaction.clone(),
+          fork: Some(SessionFork {
+              parent_session_id: self.session_id.clone(),
+              branch_name: normalize_optional_string(branch_name),
+          }),
+          persistence: None  // 清空持久化路径
+      }
+  }
+
+  特性：
+  - 生成新会话 ID
+  - 克隆所有消息和压缩元数据
+  - 记录父会话 ID 和分支名
+  - 清空持久化路径（需要重新设置）
+
+  8. 压缩记录 (lines 196-205)
+
+  pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
+      self.touch();
+      let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+      self.compaction = Some(SessionCompaction {
+          count,
+          removed_message_count,
+          summary: summary.into(),
+      });
+  }
+
+  注意：
+  - 仅记录元数据，不实际删除消息
+  - 压缩次数递增
+  - 由调用者负责实际删除消息
+
+  9. 测试覆盖 (lines 925-1238)
+
+  测试场景：
+  - JSONL 持久化和恢复
+  - 遗留 JSON 格式加载
+  - 增量消息追加
+  - 压缩元数据持久化
+  - 会话分叉和元数据
+  - 文件轮转和清理
+  - 错误处理：缺失字段、未知类型、无效格式
+  - 边界情况：空白分支名规范化
+
+  设计亮点
+
+  1. 增量持久化：避免每次都重写整个文件，提高性能
+  2. 原子写入：使用临时文件 + 重命名，防止写入中断导致数据损坏
+  3. 文件轮转：自动管理大文件，防止无限增长
+  4. 向后兼容：支持遗留 JSON 格式，平滑迁移
+  5. 失败回滚：追加失败时自动回滚内存状态
+  6. 类型安全：使用枚举和结构体，避免字符串魔法值
+  7. 测试完善：覆盖正常流程和错误场景
+
+  与 main.rs 的集成
+
+  - LiveCli 使用 Session 存储对话历史
+  - create_managed_session_handle() 创建 .claw/sessions/<id>.jsonl 路径
+  - resolve_session_reference() 解析 latest 别名和会话 ID
+  - /session fork 命令调用 Session::fork()
+  - /compact 命令调用 Session::record_compaction()
+
+  这个模块是整个 CLI 的数据持久化基础，设计简洁、健壮、高效。
+
+

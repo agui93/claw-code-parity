@@ -1,0 +1,70 @@
+这是 claw-code-parity 仓库，一个对 Claude Code 的 Rust 移植项目，目标是实现与原版 TypeScript 实现的功能对等（parity）。         
+                                                                                                                                  
+  具体来说：                                                                                                                      
+                                                                                                                                  
+  - 原始背景：2026年3月31日 Claude Code 源码泄露后，作者基于对其架构的研究，用 Python 做了初步的 clean-room 重写，后来又启动了    
+  Rust 移植                                                                                                                       
+  - 核心内容：rust/ 目录下是活跃的 Rust workspace，包含 api、runtime、tools、commands、rusty-claude-cli 等 crate               
+  - 当前状态：Rust 移植已有可用的核心（REPL、API 客户端、OAuth、工具注册表、MCP 配置解析），但与 TS                               
+  原版相比还有较大差距，主要缺口在 hook 执行、插件系统、CLI 广度、工具覆盖率等方面                                                
+
+  PARITY.md 是一份详细的功能差距分析报告，列出了 7 个主要领域的对比和优先级排序。
+
+
+
+---
+
+src/ 是一个相当完整的 Python 移植工作区，结构上高度对应原版 TypeScript 的目录布局，主要包含：
+                                                                                                                                  
+  - 核心运行时：main.py, runtime.py, context.py, history.py, query.py       
+  - 工具层：tools.py, tool_pool.py, Tool.py, QueryEngine.py                                                                       
+  - 命令系统：commands.py, command_graph.py                                                                                       
+  - 服务/功能模块：services/, hooks/, skills/, plugins/, permissions.py
+  - CLI 相关：cli/, entrypoints/, direct_modes.py                                                                                 
+  - 助手/协调器：assistant/, coordinator/
+  - 远程/服务端：remote/, server/, bridge/
+  - UI 组件：components/, screens/, outputStyles/
+  - 其他：migrations/, schemas/, types/, utils/, vim/, voice/
+
+  比 README 描述的要丰富得多——README 说只有几个文件，但实际上已经有了相当深度的目录结构，覆盖了
+  hooks、skills、plugins、coordinator、assistant 等核心子系统。
+
+
+---
+
+❯ 如果我想快速阅读和梳理这个仓库，应该从哪儿入手                                                                                  
+                                                                                           
+⏺ 从这几个入口开始最高效：                                                                                                        
+                                                                                                                                  
+  1. 先看顶层文档
+  - README.md — 项目背景和定位（已读）                                                                                            
+  - PARITY.md — 功能差距分析，是理解整体目标的最佳地图
+                                                                                                                                  
+  2. Rust 实现主入口
+  - rust/crates/rusty-claude-cli/src/main.rs — CLI 主逻辑，agentic loop 在这里
+  - rust/crates/runtime/src/conversation.rs — 核心对话/工具执行循环
+  - rust/crates/tools/src/lib.rs — 工具注册表，看支持哪些工具
+
+  3. Python 移植层
+  - src/main.py — Python 入口
+  - src/tools.py + src/commands.py — 工具和命令的 Python 侧元数据
+  - src/query_engine.py — parity 审计逻辑
+
+  4. 快速跑一下
+  # 看 Python 移植摘要
+  python3 -m src.main summary
+
+  # 看 Rust 构建状态
+  cd rust && cargo check --workspace
+
+  建议路径：PARITY.md → conversation.rs → main.rs → tools/src/lib.rs，这条线能让你在30分钟内建立起对整个 Rust 运行时的清晰认知。
+
+
+
+
+
+
+
+
+
+

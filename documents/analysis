@@ -1,0 +1,342 @@
+从这几个入口开始最高效：                                                                                                        
+                                                                                                                                  
+  1. 先看顶层文档
+  - README.md — 项目背景和定位（已读）                                                                                            
+  - PARITY.md — 功能差距分析，是理解整体目标的最佳地图
+                                                                                                                                  
+  2. Rust 实现主入口
+  - rust/crates/rusty-claude-cli/src/main.rs — CLI 主逻辑，agentic loop 在这里
+  - rust/crates/runtime/src/conversation.rs — 核心对话/工具执行循环
+  - rust/crates/tools/src/lib.rs — 工具注册表，看支持哪些工具
+
+  3. Python 移植层
+  - src/main.py — Python 入口
+  - src/tools.py + src/commands.py — 工具和命令的 Python 侧元数据
+  - src/query_engine.py — parity 审计逻辑
+
+  4. 快速跑一下
+  # 看 Python 移植摘要
+  python3 -m src.main summary
+
+  # 看 Rust 构建状态
+  cd rust && cargo check --workspace
+
+  建议路径：PARITY.md → conversation.rs → main.rs → tools/src/lib.rs，这条线能让你在30分钟内建立起对整个 Rust 运行时的清晰认知。
+
+
+
+
+
+
+
+
+ 从 `rust/crates/runtime/src/conversation.rs` 开始读         
+
+conversation.rs 已经读完了。这是整个 Rust 运行时的核心文件，下面是梳理：                                                  
+                                   
+  ---                                                                                                                             
+  整体结构        
+                                                                                                                                  
+  ConversationRuntime<C, T> 是泛型结构体，C: ApiClient，T: ToolExecutor，通过 trait 解耦 API 调用和工具执行。
+                                                                                                                                  
+  核心 agentic loop — run_turn()（第 286-475 行）
+
+  用户输入 → push 到 session
+    └─ loop:
+         1. 构造 ApiRequest，调用 api_client.stream()
+         2. build_assistant_message() 从事件流组装消息
+         3. 提取所有 pending tool_use blocks
+         4. 如果没有 tool_use → break（turn 结束）
+         5. 对每个 tool_use:
+              a. run_pre_tool_use_hook()
+              b. permission_policy.authorize_with_context()
+              c. tool_executor.execute()
+              d. run_post_tool_use_hook() 或 run_post_tool_use_failure_hook()
+              e. merge hook feedback 到输出
+              f. push tool_result 到 session
+    └─ maybe_auto_compact()
+    └─ 返回 TurnSummary
+
+  Hook 集成
+
+  与 PARITY.md 描述的"hook 只有配置没有执行"不同，这里 hook 执行已经实现了：
+  - run_pre_tool_use_hook() — 可以修改 input、取消/拒绝工具调用
+  - run_post_tool_use_hook() / run_post_tool_use_failure_hook() — 可以附加 feedback 到输出
+  - hook 结果通过 merge_hook_feedback() 注入到 tool result 里
+
+  Auto compaction
+
+  maybe_auto_compact() 在每个 turn 结束后检查累计 input tokens，超过阈值（默认 100k，可通过 CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS
+  覆盖）就压缩 session。
+
+  辅助组件
+
+  - StaticToolExecutor — 用于测试的简单工具注册表，BTreeMap<String, ToolHandler>
+  - build_assistant_message() — 把事件流（TextDelta、ToolUse、Usage 等）组装成 ConversationMessage
+  - SessionTracer — 可选的遥测，记录 turn/tool 生命周期事件
+
+  ---
+  接下来想看哪个方向？hooks.rs、permissions.rs、还是 tools/src/lib.rs？
+
+
+
+
+hooks.rs 读完了，整体梳理如下：
+                                                                                                                                  
+  ---                                                                                                           
+  Hook 执行机制                                                                                                                   
+                                                                                                                                  
+  核心是 HookRunner::run_commands()，执行流程：
+                                                                                                                                  
+  配置的 commands 列表（pre/post/failure）                                                                                        
+    └─ 对每个 command:
+         1. 构造 JSON payload，写入 stdin
+         2. 设置环境变量：HOOK_EVENT, HOOK_TOOL_NAME, HOOK_TOOL_INPUT, HOOK_TOOL_OUTPUT 等
+         3. 用 sh -lc <command> 执行（Windows 用 cmd /C）
+         4. 轮询 try_wait()，每 20ms 检查一次 abort_signal
+         5. 解析 stdout → ParsedHookOutput
+         6. 根据退出码决定 outcome：
+              exit 0  → Allow（但 stdout JSON 里 continue:false 或 decision:block 也可以 Deny）
+              exit 2  → Deny
+              其他    → Failed
+
+  Hook 输出协议（parse_hook_output()）
+
+  stdout 可以是纯文本或 JSON，JSON 支持的字段：
+  - systemMessage / reason → 附加到 messages
+  - continue: false 或 decision: "block" → deny
+  - hookSpecificOutput.additionalContext → 附加消息
+  - hookSpecificOutput.permissionDecision → allow / deny / ask，覆盖权限决策
+  - hookSpecificOutput.updatedInput → 替换传给工具的 input
+
+  取消机制
+
+  HookAbortSignal 是 Arc<AtomicBool>，可以跨线程触发。轮询循环里每 20ms 检查一次，触发后 kill 子进程并返回 Cancelled。
+
+  与 PARITY.md 的对比
+
+  PARITY.md 说 hook 执行"largely missing"，但实际上这个文件实现得相当完整，包括 PreToolUse、PostToolUse、PostToolUseFailure
+  三个事件，以及 input 修改、权限覆盖、取消信号等高级特性。PARITY.md 的分析可能是基于较早的代码状态。
+
+
+
+
+permissions.rs 不长，整体非常清晰，梳理如下：                                                                                   
+                                                    
+  ---                                                                                                                             
+  权限模式（PermissionMode）                                                                                                      
+                                                                                                                                  
+  5 个模式，有序（PartialOrd）：                                                                                                  
+  ReadOnly < WorkspaceWrite < DangerFullAccess < Prompt < Allow
+  比较顺序用于判断 current_mode >= required_mode。
+
+  授权决策流程 authorize_with_context()
+
+  1. deny_rules 命中 → 直接 Deny（最高优先级）
+  2. 检查 hook 的 permission_override：
+       Deny  → 直接 Deny
+       Ask   → 强制走 prompt_or_deny
+       Allow → 仍受 ask_rules 约束（hook allow 不能绕过 ask rules）
+  3. ask_rules 命中 → 走 prompt_or_deny
+  4. allow_rules 命中 || mode==Allow || current_mode >= required_mode → Allow
+  5. Prompt 模式 || WorkspaceWrite→DangerFullAccess 升级 → prompt_or_deny
+  6. 其他情况 → Deny
+
+  规则语法（PermissionRule::parse()）
+
+  规则字符串格式：ToolName(matcher)，支持三种 matcher：
+  - Bash(*) 或 Bash() → 匹配该工具的所有调用
+  - Bash(git status) → 精确匹配 subject
+  - Bash(git:*) → 前缀匹配（subject 以 git 开头）
+
+  subject 提取（extract_permission_subject()）
+
+  从 tool input JSON 中按优先级提取：command > path > file_path > filePath > notebook_path > url > pattern > code > message。
+
+  几个值得注意的设计细节
+
+  - prompt_or_deny：如果没有 prompter（非交互模式），ask 一律降级为 Deny
+  - hook Allow override 不能绕过 ask_rules（测试 hook_allow_still_respects_ask_rules 验证了这一点）
+  - 未知工具的默认 required_mode 是 DangerFullAccess（第 152 行），偏保守
+
+  ---
+  三个文件已经形成完整的运行时核心链路：conversation.rs 编排整体 loop → hooks.rs 执行前后置 hook → permissions.rs 做授权决策。
+
+  接下来想看 tools/src/lib.rs（工具注册表）还是 config.rs（配置结构）？
+
+
+
+ools/src/lib.rs 是这个仓库里体量最大、内容最丰富的文件，全面梳理如下：                                                         
+                                                     
+  ---                                                                                                                             
+  工具清单（mvp_tool_specs()，第 223-548 行）                                                                                     
+                                                                                                                                  
+  共 18 个工具，按权限要求分类：                                                                                                  
+                  
+  ┌──────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │     权限级别     │                                                  工具                                                   │
+  ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ReadOnly         │ read_file, glob_search, grep_search, WebFetch, WebSearch, Skill, ToolSearch, Sleep, SendUserMessage,    │
+  │                  │ StructuredOutput                                                                                        │
+  ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ WorkspaceWrite   │ write_file, edit_file, NotebookEdit, TodoWrite, Config                                                  │
+  ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ DangerFullAccess │ bash, Agent, REPL, PowerShell                                                                           │
+  └──────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  Agent 工具（第 1516-1762 行）
+
+  这是文件里最重的部分，实现了一个完整的子 agent 系统：
+
+  execute_agent()
+    → 创建 agent_id（纳秒时间戳）
+    → 写 output .md 文件 + manifest .json 文件
+    → spawn_agent_job() 在独立线程里运行
+        → build_agent_runtime() 构造完整 ConversationRuntime
+        → runtime.run_turn(prompt)
+        → persist_agent_terminal_state()（completed / failed）
+
+  不同 subagent_type 有不同的允许工具集（Explore 只读、Plan 加 TodoWrite、Verification 加 bash、默认全集）。子 agent 用自己独立的
+  ProviderRuntimeClient 跑完整的 agentic loop，结果写到 .clawd-agents/<agent_id>.md。
+
+  ---
+  ProviderRuntimeClient（第 1811-1943 行）
+
+  子 agent 的 API 客户端，实现 ApiClient trait，内部用 tokio::runtime::Runtime::new() + block_on 把异步 API
+  调用桥接到同步接口。流式解析逻辑：用 BTreeMap<u32, (id, name, input)> 作 pending_tools，按 block index 累积 InputJsonDelta，在
+  ContentBlockStop 时 emit ToolUse 事件。有 streaming 失败降级路径（fallback 到非流式）。
+
+  关键细节（push_output_block 第 2030-2037 行）：当 streaming 模式且工具 input 是空 object {} 时，初始化为空字符串而不是 "{}" —
+  这对应 PARITY.md 提到的 {} 前缀 bug 修复。
+
+  ---
+  WebSearch 实现（第 1037-1088 行）
+
+  直接抓 DuckDuckGo HTML（html.duckduckgo.com/html/），手写 HTML 解析提取 .result__a 锚点，解码 DDG 重定向 URL，支持
+  allowed_domains/blocked_domains 过滤，结果最多 8 条去重。可通过 CLAWD_WEB_SEARCH_BASE_URL 环境变量替换搜索引擎。
+
+  ---
+  Skill 工具（第 1432-1509 行）
+
+  按优先级搜索技能目录：$CODEX_HOME/skills → ~/.agents/skills → ~/.config/opencode/skills → ~/.codex/skills →
+  /home/bellman/.codex/skills（hardcoded，疑似开发者路径残留）。
+
+  ---
+  几个值得注意的细节
+
+  - iso8601_now()（第 2291 行）实际返回的是 Unix 秒时间戳字符串，并非真正的 ISO 8601 格式
+  - Todo 全部完成时自动清空存储，且 ≥3 个 todo 全完成但没有含 "verif" 的条目时，会设 verification_nudge_needed: true
+  - Config 工具直接读写 ~/.claw/settings.json 和 .claw/settings.local.json
+  - REPL 支持 python/js/shell 三种语言，最大 sleep 300 秒
+
+
+
+
+
+已读完 rust/crates/rusty-claude-cli/src/main.rs (6443 行)。这是 CLI 的主入口文件，包含完整的 REPL
+  实现、命令解析、工具渲染、测试套件等。
+
+  核心结构总结
+
+  1. CLI 入口与命令解析 (lines 1-1500)
+
+  - main() → run() → parse_args() 解析命令行参数
+  - CliAction 枚举：Repl, Prompt, ResumeSession, Login, Logout, Status, Sandbox, Version, Help, Init, Agents, Skills,
+  DumpManifests, BootstrapPlan, PrintSystemPrompt
+  - 默认权限模式：DangerFullAccess（从环境变量 RUSTY_CLAUDE_PERMISSION_MODE 读取）
+  - 模型别名：opus→claude-opus-4-6, sonnet→claude-sonnet-4-6, haiku→claude-haiku-4-5-20251213
+
+  2. LiveCli 结构 (lines 1500-2500)
+
+  - 持有 `ConversationRuntime
+  RuntimeClient, CliToolExecutor>`
+  - run_repl(): LineEditor 循环 → 解析斜杠命令 → 执行或调用 run_turn()
+  - 斜杠命令：/help, /status, /sandbox, /compact, /model, /permissions, /clear, /cost, /resume, /config, /memory, /init, /diff,
+  /version, /export, /session, /plugins, /agents, /skills, /bughunter, /commit, /pr, /issue, /ultraplan, /teleport,
+  /debug-tool-call
+  - Levenshtein 距离用于命令建议（阈值 ≤ 4）
+
+  3. OAuth 登录流程 (lines 2500-2800)
+
+  - PKCE 流程：生成 code_verifier → 启动 loopback TCP 服务器（端口 4545）→ 打开浏览器 → 等待回调 → 交换 token
+  - 使用 open/xdg-open/cmd 打开浏览器
+
+  4. 进度报告系统 (lines 3400-3650)
+
+  - InternalPromptProgressReporter: 用于长时间运行的内部提示（如 ultraplan）
+  - 心跳线程每 3 秒更新一次进度
+  - 跟踪阶段：model（API 调用）→ tool（工具执行）→ text（文本生成）
+  - 进度事件：Started, Update, Heartbeat, Complete, Failed
+
+  5. AnthropicRuntimeClient (lines 3767-3955)
+
+  - 实现 ApiClient trait
+  - 使用 tokio::runtime::Runtime::block_on() 桥接异步到同步
+  - 流式处理：pending_tool 累积 input_json_delta 事件
+  - {} 前缀 bug 修复：流式模式下跳过空对象初始输入（line 4557-4564）
+  - 回退到非流式请求：如果流中断且未收到 MessageStop
+
+  6. CliToolExecutor (lines 4612-4668)
+
+  - 实现 ToolExecutor trait
+  - 检查 allowed_tools 白名单
+  - 调用 tool_registry.execute()
+  - 使用 TerminalRenderer 渲染 markdown 输出
+
+  7. 工具渲染系统 (lines 4103-4534)
+
+  - format_tool_call_start(): 显示工具调用开始（带彩色边框）
+  - format_tool_result(): 显示工具结果（成功 ✓ / 失败 ✗）
+  - 特殊格式化：bash, read_file, write_file, edit_file, glob_search, grep_search
+  - 输出截断：read 最多 80 行/6000 字符，其他工具 60 行/4000 字符
+  - 截断提示："… output truncated for display; full result preserved in session."
+
+  8. 会话管理 (lines 2800-3200)
+
+  - 自动保存到 .claw/sessions/<session-id>.jsonl
+  - latest 别名：解析为最新的会话文件（按 mtime 排序）
+  - 支持 .json 和 .jsonl 格式（优先 .jsonl）
+  - /session list|switch|fork 命令
+
+  9. Hook 进度报告 (lines 3685-3716)
+
+  - CliHookProgressReporter: 实现 HookProgressReporter trait
+  - 输出到 stderr：[hook {event}] {tool}: {command}
+  - 事件：Started, Completed, Cancelled
+
+  10. 权限提示器 (lines 3718-3765)
+
+  - CliPermissionPrompter: 实现 PermissionPrompter trait
+  - 显示工具名、当前模式、所需模式、原因、输入
+  - 提示用户 [y/N] 批准
+
+  11. 测试套件 (lines 4847-6443, ~1600 行)
+
+  - 命令解析测试：参数、别名、权限模式、allowed_tools
+  - 工具渲染测试：截断、格式化、边界情况
+  - Git 工作区解析测试：status, diff, branch 检测
+  - 会话解析测试：latest 别名、.json/.jsonl 解析
+  - 进度报告测试：ultraplan, commit, pr, issue
+  - 流式处理测试：{} 前缀 bug, thinking blocks
+  - Hook abort 测试：中断信号传播
+
+  关键实现细节
+
+  1. 流式工具输入累积：pending_tool: Option<(id, name, input)> 在 ContentBlockDelta::InputJsonDelta 事件中累积，在
+  ContentBlockStop 时发出完整的 ToolUse 事件
+  2. {} 前缀 bug 修复：流式模式下，content_block_start 事件包含空对象 {}，真实输入通过 input_json_delta 
+  到达。修复方法：检测空对象并初始化为空字符串（line 4557-4564）
+  3. Markdown 流式渲染：使用 MarkdownStreamState 累积文本块，通过 TerminalRenderer 转换为 ANSI 转义序列
+  4. Hook 中断信号：HookAbortMonitor 监听 Ctrl-C，设置 Arc<AtomicBool>，hook 执行循环每 20ms 检查一次
+  5. 自动压缩：每轮后检查累积输入 token 是否超过阈值（默认 100k），触发 maybe_auto_compact()
+  6. 权限策略构建：从 tool_registry.permission_specs() 读取工具权限要求，合并到 PermissionPolicy
+  7. 提示缓存记录：从 AnthropicClient 提取 PromptCacheRecord，转换为 PromptCacheEvent 并添加到事件流
+  8. 会话引用解析：latest → 查找 .claw/sessions/ 中最新的 .jsonl 或 .json 文件；session-id → 尝试 .jsonl 后回退到 .json
+  9. 斜杠命令补全：动态生成候选列表，包括模型别名、权限模式、最近会话 ID、插件命令
+  10. 工具输出截断：仅用于显示，完整输出保留在会话中。截断逻辑：按行数和字符数双重限制，超出时附加截断提示
+
+  这个文件是整个 CLI 的核心，将所有组件（runtime, tools, api, plugins, hooks,
+  permissions）整合在一起，提供完整的用户交互界面。代码质量高，测试覆盖全面，错误处理完善。
+
+	
